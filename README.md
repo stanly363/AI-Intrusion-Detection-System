@@ -33,7 +33,7 @@ git clone [https://github.com/your-username/ai-intrusion-detection-system.git](h
 cd ai-intrusion-detection-system
 
 # Install the required libraries
-pip install tensorflow pandas scapy numpy scikit-learn matplotlib seaborn opendatasets joblib
+pip install tensorflow pandas scapy numpy scikit-learn matplotlib seaborn opendatasets joblib kagglehub
 ```
 
 ### 2. Choose Your Path
