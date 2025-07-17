@@ -4,13 +4,14 @@ import numpy as np
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
 import seaborn as sns
-import opendatasets as od
+import kagglehub
 import os
 import warnings
 import joblib
-
+import keras_tuner as kt # Import KerasTuner
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -20,76 +21,43 @@ print("TensorFlow Version:", tf.__version__)
 # --- Step 1: Download and Load the Data ---
 def download_and_load_data():
     """
-    Downloads the NSL-KDD dataset from Kaggle if not present and loads it into pandas DataFrames.
+    Downloads the UNSW-NB15 dataset using KaggleHub and loads it into pandas DataFrames.
     """
-    dataset_url = 'https://www.kaggle.com/datasets/shivamalakkad/nslkdd-dataset'
-    dataset_dir = 'nslkdd-dataset'
-    train_file = os.path.join(dataset_dir, 'KDDTrain+.txt')
-    test_file = os.path.join(dataset_dir, 'KDDTest+.txt')
-
-    # Download the dataset if the directory doesn't exist
-    if not os.path.isdir(dataset_dir):
-        print(f"Downloading dataset from Kaggle: {dataset_url}")
-        print("You will be prompted for your Kaggle username and API key.")
-        od.download(dataset_url)
-    else:
-        print("Dataset directory already exists.")
-
-    # Define column names for the dataset
-    col_names = ["duration", "protocol_type", "service", "flag", "src_bytes", "dst_bytes", "land", 
-                 "wrong_fragment", "urgent", "hot", "num_failed_logins", "logged_in", "num_compromised", 
-                 "root_shell", "su_attempted", "num_root", "num_file_creations", "num_shells", 
-                 "num_access_files", "num_outbound_cmds", "is_host_login", "is_guest_login", "count", 
-                 "srv_count", "serror_rate", "srv_serror_rate", "rerror_rate", "srv_rerror_rate", 
-                 "same_srv_rate", "diff_srv_rate", "srv_diff_host_rate", "dst_host_count", 
-                 "dst_host_srv_count", "dst_host_same_srv_rate", "dst_host_diff_srv_rate", 
-                 "dst_host_same_src_port_rate", "dst_host_srv_diff_host_rate", "dst_host_serror_rate", 
-                 "dst_host_srv_serror_rate", "dst_host_rerror_rate", "dst_host_srv_rerror_rate", 
-                 "attack_type", "difficulty_level"]
-    
-    # Load data from the files
+    print("--- Downloading and Loading Data ---")
     try:
-        df_train = pd.read_csv(train_file, header=None, names=col_names)
-        df_test = pd.read_csv(test_file, header=None, names=col_names)
-        print("NSL-KDD datasets loaded successfully.")
+        dataset_path = kagglehub.dataset_download("mrwellsdavid/unsw-nb15")
+        print(f"Dataset downloaded to: {dataset_path}")
+        train_file_path = os.path.join(dataset_path, 'UNSW_NB15_training-set.csv')
+        test_file_path = os.path.join(dataset_path, 'UNSW_NB15_testing-set.csv')
+        df_train = pd.read_csv(train_file_path)
+        df_test = pd.read_csv(test_file_path)
+        print("UNSW-NB15 datasets loaded successfully.")
         return df_train, df_test
-    except FileNotFoundError:
-        print(f"Error: Could not find dataset files at {train_file} and {test_file}.")
-        print("Please ensure the download was successful and the paths are correct.")
+    except Exception as e:
+        print(f"An error occurred during data loading: {e}")
         return None, None
 
-# Execute data loading
 df_train, df_test = download_and_load_data()
-
 if df_train is None or df_test is None:
     exit()
 
+
 # --- Step 2: Preprocess the Data ---
 print("\n--- Preprocessing Data ---")
+df_train = df_train.drop(['id', 'attack_cat'], axis=1)
+df_test = df_test.drop(['id', 'attack_cat'], axis=1)
 
-# Drop the 'difficulty_level' column as it's not needed for classification
-df_train = df_train.drop('difficulty_level', axis=1)
-df_test = df_test.drop('difficulty_level', axis=1)
+X_train_raw = df_train.drop('label', axis=1)
+y_train = df_train['label']
+X_test_raw = df_test.drop('label', axis=1)
+y_test = df_test['label']
 
-# Convert the 'attack_type' text labels into binary numerical labels: 0 for 'normal', 1 for 'attack'
-df_train['attack_binary'] = df_train['attack_type'].apply(lambda x: 0 if x == 'normal' else 1)
-df_test['attack_binary'] = df_test['attack_type'].apply(lambda x: 0 if x == 'normal' else 1)
-
-# Separate features (X) and the binary target label (y)
-X_train_raw = df_train.drop(['attack_type', 'attack_binary'], axis=1)
-y_train = df_train['attack_binary']
-X_test_raw = df_test.drop(['attack_type', 'attack_binary'], axis=1)
-y_test = df_test['attack_binary']
-
-# Identify which columns are text-based (categorical) and which are numerical
 categorical_cols = X_train_raw.select_dtypes(include=['object']).columns
 numerical_cols = X_train_raw.select_dtypes(include=np.number).columns
 
-# Use One-Hot Encoding on categorical features
 X_train = pd.get_dummies(X_train_raw, columns=categorical_cols, dummy_na=False)
 X_test = pd.get_dummies(X_test_raw, columns=categorical_cols, dummy_na=False)
 
-# Align columns between training and test sets to ensure they have the same features
 train_cols = X_train.columns
 test_cols = X_test.columns
 missing_in_test = set(train_cols) - set(test_cols)
@@ -100,52 +68,98 @@ for c in missing_in_train:
     X_train[c] = 0
 X_test = X_test[X_train.columns]
 
-# Scale numerical features to a standard range
 scaler = StandardScaler()
 X_train[numerical_cols] = scaler.fit_transform(X_train[numerical_cols])
 X_test[numerical_cols] = scaler.transform(X_test[numerical_cols])
-
 print(f"Data preprocessed. Training features shape: {X_train.shape}")
 
-
-# --- Step 3: Build the AI Model ---
-print("\n--- Building the AI Model ---")
-
-model = tf.keras.models.Sequential([
-    tf.keras.layers.Dense(128, activation='relu', input_shape=(X_train.shape[1],)),
-    tf.keras.layers.Dropout(0.3),
-    tf.keras.layers.Dense(64, activation='relu'),
-    tf.keras.layers.Dropout(0.2),
-    tf.keras.layers.Dense(1, activation='sigmoid')
-])
-
-model.compile(optimizer='adam', 
-              loss='binary_crossentropy', 
-              metrics=['accuracy'])
-model.summary()
+# --- Optimization: Calculate Class Weights for Imbalanced Data ---
+class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+class_weight_dict = dict(enumerate(class_weights))
+print(f"Calculated Class Weights: {class_weight_dict}")
 
 
-# --- Step 4: Train the AI Model ---
-print("\n--- Training the AI Model ---")
+# --- Step 3: Hyperparameter Tuning with KerasTuner ---
+print("\n--- Building Model with KerasTuner ---")
 
+def build_model(hp):
+    """Builds a tunable model for KerasTuner."""
+    model = tf.keras.models.Sequential()
+    
+    # Tune the number of units in the first Dense layer
+    hp_units_1 = hp.Int('units_1', min_value=64, max_value=256, step=32)
+    model.add(tf.keras.layers.Dense(units=hp_units_1, activation='relu', input_shape=(X_train.shape[1],)))
+    
+    # Tune the dropout rate for the first layer
+    hp_dropout_1 = hp.Float('dropout_1', min_value=0.1, max_value=0.5, step=0.1)
+    model.add(tf.keras.layers.Dropout(rate=hp_dropout_1))
+
+    # Tune the number of units in the second Dense layer
+    hp_units_2 = hp.Int('units_2', min_value=32, max_value=128, step=32)
+    model.add(tf.keras.layers.Dense(units=hp_units_2, activation='relu'))
+
+    # Tune the dropout rate for the second layer
+    hp_dropout_2 = hp.Float('dropout_2', min_value=0.1, max_value=0.5, step=0.1)
+    model.add(tf.keras.layers.Dropout(rate=hp_dropout_2))
+    
+    model.add(tf.keras.layers.Dense(1, activation='sigmoid'))
+    
+    # Tune the learning rate for the optimizer
+    hp_learning_rate = hp.Choice('learning_rate', values=[1e-2, 1e-3, 1e-4])
+    
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=hp_learning_rate),
+                  loss='binary_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+# Instantiate the tuner
+tuner = kt.Hyperband(build_model,
+                     objective='val_accuracy',
+                     max_epochs=20, # More epochs for a more thorough search
+                     factor=3,
+                     directory='keras_tuner_dir',
+                     project_name='ids_hyperparameter_tuning')
+
+# Create a callback to stop training early if the validation loss is not improving
+stop_early = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)
+
+print("\n--- Starting Hyperparameter Search ---")
+tuner.search(X_train, y_train, epochs=50, validation_split=0.2, callbacks=[stop_early])
+
+# Get the optimal hyperparameters
+best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+print(f"\nBest hyperparameters found: {best_hps.values}")
+
+
+# --- Step 4: Train the Final, Optimized AI Model ---
+print("\n--- Training the Final Optimized AI Model ---")
+
+# Build the model with the optimal hyperparameters
+final_model = tuner.hypermodel.build(best_hps)
+final_model.summary()
+
+# Define callbacks for final training
+# Optimization: Reduce learning rate when a metric has stopped improving.
+reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=0.00001)
 early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
-history = model.fit(X_train, y_train,
-                    epochs=50,
-                    batch_size=128,
-                    validation_split=0.15,
-                    callbacks=[early_stopping],
-                    verbose=1)
-print("Model training finished.")
+history = final_model.fit(X_train, y_train,
+                          epochs=100, # Train for more epochs with early stopping
+                          batch_size=128,
+                          validation_split=0.15,
+                          callbacks=[early_stopping, reduce_lr],
+                          class_weight=class_weight_dict, # Apply class weights
+                          verbose=1)
+print("Final model training finished.")
 
 
-# --- Step 5: Evaluate the Model's Performance ---
-print("\n--- Evaluating Model Performance ---")
+# --- Step 5: Evaluate the Optimized Model's Performance ---
+print("\n--- Evaluating Optimized Model Performance ---")
 
-loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
+loss, accuracy = final_model.evaluate(X_test, y_test, verbose=0)
 print(f"Test Accuracy: {accuracy*100:.2f}%")
 
-y_pred_probs = model.predict(X_test)
+y_pred_probs = final_model.predict(X_test)
 y_pred = (y_pred_probs > 0.5).astype(int)
 print("\nClassification Report:")
 print(classification_report(y_test, y_pred, target_names=['Normal', 'Attack']))
@@ -154,20 +168,20 @@ print("Confusion Matrix:")
 cm = confusion_matrix(y_test, y_pred)
 print(cm)
 
-# Create, save, and show the confusion matrix plot
 plt.figure(figsize=(7, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Predicted Normal', 'Predicted Attack'], yticklabels=['Actual Normal', 'Actual Attack'])
-plt.title('Confusion Matrix')
+plt.title('Optimized Model Confusion Matrix')
 plt.ylabel('Actual Label')
 plt.xlabel('Predicted Label')
-plt.savefig('confusion_matrix.png', dpi=300, bbox_inches='tight')
+plt.savefig('optimized_confusion_matrix.png', dpi=300, bbox_inches='tight')
 plt.show()
 
 
-# --- Step 6: Save the Trained Model ---
-print("\n--- Saving the Trained Model ---")
-model.save('ids_model.h5')
-print("Model saved as 'ids_model.h5'")
+# --- Step 6: Save the Trained Model and Supporting Files ---
+print("\n--- Saving the Optimized Model ---")
+final_model.save('ids_optimized_model.keras') # Save in the modern .keras format
+print("Model saved as 'ids_optimized_model.keras'")
+
 joblib.dump(scaler, 'scaler.gz')
 joblib.dump(X_train.columns, 'model_columns.pkl')
 print("Scaler and model columns saved.")
