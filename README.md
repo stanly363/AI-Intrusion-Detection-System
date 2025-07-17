@@ -42,10 +42,10 @@ You have two options: use the pre-trained model for quick setup or train a new m
 
 #### Option A: Use the Pre-trained Model (Recommended for Quick Use)
 
-This is the fastest way to get started.
+This is the fastest way to get started. The required model files are included in the root of this repository.
 
-1.  **Download the Model Files:**
-    With this GitHub repository comes the following three files ensure they are in the root directory of your project.
+1.  **Verify the Model Files:**
+    Ensure the following three files are present in the root directory of the project you just cloned:
     * `ids_model.h5`
     * `scaler.gz`
     * `model_columns.pkl`
@@ -78,18 +78,17 @@ Follow these steps if you want to train the model from scratch.
 
 Once you have the three model artifact files (either by downloading or by training), you can run the live IDS.
 
-1.  **Configure the Network Interface:**
-    Open the `IDS.py` file in a text editor. Find the following line and change `"eth0"` to the name of the network interface you want to monitor (e.g., `enp0s3`, `wlan0`). This should be the interface connected to your network's mirror or SPAN port.
-    ```python
-    # file: IDS.py
-    NETWORK_INTERFACE = "eth0" 
-    ```
+The script needs root privileges to capture network packets and requires you to specify which network interface to monitor.
 
-2.  **Run the Live Analyzer:**
-    The script needs root privileges to capture network packets. Run it using `sudo`:
-    ```bash
-    sudo python IDS.py
-    ```
+Run the `IDS.py` script from your terminal using `sudo` and provide the interface name with the `--interface` flag.
+
+```bash
+# Example for an interface named 'eth0'
+sudo python IDS.py --interface eth0
+
+# Example for an interface named 'enp0s3'
+sudo python IDS.py --interface enp0s3
+```
 
 The system will now start monitoring traffic. It will print a real-time, color-coded alert to your console whenever it detects a connection that it classifies as malicious. Press `Ctrl+C` to stop the analyzer.
 
