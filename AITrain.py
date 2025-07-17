@@ -9,6 +9,8 @@ import seaborn as sns
 import opendatasets as od
 import os
 import warnings
+import joblib
+
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -166,3 +168,6 @@ plt.show()
 print("\n--- Saving the Trained Model ---")
 model.save('ids_model.h5')
 print("Model saved as 'ids_model.h5'")
+joblib.dump(scaler, 'scaler.gz')
+joblib.dump(X_train.columns, 'model_columns.pkl')
+print("Scaler and model columns saved.")
