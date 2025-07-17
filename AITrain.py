@@ -3,15 +3,16 @@ import pandas as pd
 import numpy as np
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_curve
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.ensemble import RandomForestClassifier
 import matplotlib.pyplot as plt
 import seaborn as sns
 import kagglehub
 import os
 import warnings
 import joblib
-import keras_tuner as kt # Import KerasTuner
+import keras_tuner as kt
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -20,9 +21,7 @@ print("TensorFlow Version:", tf.__version__)
 
 # --- Step 1: Download and Load the Data ---
 def download_and_load_data():
-    """
-    Downloads the UNSW-NB15 dataset using KaggleHub and loads it into pandas DataFrames.
-    """
+    """Downloads the UNSW-NB15 dataset and loads it."""
     print("--- Downloading and Loading Data ---")
     try:
         dataset_path = kagglehub.dataset_download("mrwellsdavid/unsw-nb15")
@@ -71,16 +70,32 @@ X_test = X_test[X_train.columns]
 scaler = StandardScaler()
 X_train[numerical_cols] = scaler.fit_transform(X_train[numerical_cols])
 X_test[numerical_cols] = scaler.transform(X_test[numerical_cols])
-print(f"Data preprocessed. Training features shape: {X_train.shape}")
-
-# --- Optimization: Calculate Class Weights for Imbalanced Data ---
-class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-class_weight_dict = dict(enumerate(class_weights))
-print(f"Calculated Class Weights: {class_weight_dict}")
+print(f"Data preprocessed. Full feature shape: {X_train.shape}")
 
 
-# --- Step 3: Hyperparameter Tuning with KerasTuner ---
-print("\n--- Building Model with KerasTuner ---")
+# --- Step 3: Advanced Optimization - Feature Selection ---
+print("\n--- Performing Feature Selection with Random Forest ---")
+# Train a Random Forest to find the most important features
+feature_selector = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+feature_selector.fit(X_train, y_train)
+
+# Get feature importances and select the top N features
+importances = feature_selector.feature_importances_
+# Let's select the top 60 features as a starting point
+N_FEATURES = 60
+indices = np.argsort(importances)[::-1]
+top_n_features = X_train.columns[indices[:N_FEATURES]]
+
+print(f"Selected Top {N_FEATURES} features.")
+
+# Filter the datasets to use only the selected features
+X_train_selected = X_train[top_n_features]
+X_test_selected = X_test[top_n_features]
+print(f"New training features shape: {X_train_selected.shape}")
+
+
+# --- Step 4: Hyperparameter Tuning on Selected Features ---
+print("\n--- Building Model with KerasTuner on Selected Features---")
 
 def build_model(hp):
     """Builds a tunable model for KerasTuner."""
@@ -88,7 +103,7 @@ def build_model(hp):
     
     # Tune the number of units in the first Dense layer
     hp_units_1 = hp.Int('units_1', min_value=64, max_value=256, step=32)
-    model.add(tf.keras.layers.Dense(units=hp_units_1, activation='relu', input_shape=(X_train.shape[1],)))
+    model.add(tf.keras.layers.Dense(units=hp_units_1, activation='relu', input_shape=(X_train_selected.shape[1],)))
     
     # Tune the dropout rate for the first layer
     hp_dropout_1 = hp.Float('dropout_1', min_value=0.1, max_value=0.5, step=0.1)
@@ -115,73 +130,90 @@ def build_model(hp):
 # Instantiate the tuner
 tuner = kt.Hyperband(build_model,
                      objective='val_accuracy',
-                     max_epochs=20, # More epochs for a more thorough search
+                     max_epochs=20,
                      factor=3,
-                     directory='keras_tuner_dir',
-                     project_name='ids_hyperparameter_tuning')
+                     directory='keras_tuner_dir_selected', # Use a new directory for this tuning run
+                     project_name='ids_selected_features_tuning')
 
-# Create a callback to stop training early if the validation loss is not improving
-stop_early = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)
+# Create a callback to stop training early during tuning
+stop_early_tuner = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)
 
-print("\n--- Starting Hyperparameter Search ---")
-tuner.search(X_train, y_train, epochs=50, validation_split=0.2, callbacks=[stop_early])
+print("\n--- Starting Hyperparameter Search on Selected Features ---")
+tuner.search(X_train_selected, y_train, epochs=50, validation_split=0.2, callbacks=[stop_early_tuner])
 
 # Get the optimal hyperparameters
 best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
 print(f"\nBest hyperparameters found: {best_hps.values}")
 
-
-# --- Step 4: Train the Final, Optimized AI Model ---
-print("\n--- Training the Final Optimized AI Model ---")
-
 # Build the model with the optimal hyperparameters
 final_model = tuner.hypermodel.build(best_hps)
 final_model.summary()
 
-# Define callbacks for final training
-# Optimization: Reduce learning rate when a metric has stopped improving.
+
+# --- Step 5: Train the Final Model on Selected Features ---
+print("\n--- Training the Final Model on Selected Features ---")
+class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+class_weight_dict = dict(enumerate(class_weights))
+print(f"Using Class Weights: {class_weight_dict}")
+
 reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=0.00001)
 early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
-history = final_model.fit(X_train, y_train,
-                          epochs=100, # Train for more epochs with early stopping
+history = final_model.fit(X_train_selected, y_train,
+                          epochs=100,
                           batch_size=128,
                           validation_split=0.15,
                           callbacks=[early_stopping, reduce_lr],
-                          class_weight=class_weight_dict, # Apply class weights
+                          class_weight=class_weight_dict,
                           verbose=1)
 print("Final model training finished.")
 
 
-# --- Step 5: Evaluate the Optimized Model's Performance ---
-print("\n--- Evaluating Optimized Model Performance ---")
-
-loss, accuracy = final_model.evaluate(X_test, y_test, verbose=0)
+# --- Step 6: Evaluate and Tune Threshold ---
+print("\n--- Evaluating Final Model Performance ---")
+loss, accuracy = final_model.evaluate(X_test_selected, y_test, verbose=0)
 print(f"Test Accuracy: {accuracy*100:.2f}%")
 
-y_pred_probs = final_model.predict(X_test)
-y_pred = (y_pred_probs > 0.5).astype(int)
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred, target_names=['Normal', 'Attack']))
+y_pred_probs = final_model.predict(X_test_selected).ravel()
 
-print("Confusion Matrix:")
-cm = confusion_matrix(y_test, y_pred)
+# Plot Precision-Recall Curve to find the best threshold
+precision, recall, thresholds = precision_recall_curve(y_test, y_pred_probs)
+# Add a small epsilon to avoid division by zero
+f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
+# locate the index of the largest f1 score
+best_threshold_idx = np.argmax(f1_scores)
+best_threshold = thresholds[best_threshold_idx]
+
+print(f"\nBest Threshold (for balanced F1-score): {best_threshold:.4f}")
+print("This threshold balances precision and recall. You can adjust it based on your needs.")
+print("To prioritize catching more attacks (higher recall), you would use a LOWER threshold.")
+
+# Evaluate using the new, optimized threshold
+y_pred_tuned = (y_pred_probs > best_threshold).astype(int)
+
+print("\nClassification Report (at Optimal Threshold):")
+print(classification_report(y_test, y_pred_tuned, target_names=['Normal', 'Attack']))
+
+print("Confusion Matrix (at Optimal Threshold):")
+cm = confusion_matrix(y_test, y_pred_tuned)
 print(cm)
 
 plt.figure(figsize=(7, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Predicted Normal', 'Predicted Attack'], yticklabels=['Actual Normal', 'Actual Attack'])
-plt.title('Optimized Model Confusion Matrix')
+plt.title('Further Optimized Model Confusion Matrix')
 plt.ylabel('Actual Label')
 plt.xlabel('Predicted Label')
-plt.savefig('optimized_confusion_matrix.png', dpi=300, bbox_inches='tight')
+plt.savefig('further_optimized_confusion_matrix.png', dpi=300, bbox_inches='tight')
 plt.show()
 
 
-# --- Step 6: Save the Trained Model and Supporting Files ---
-print("\n--- Saving the Optimized Model ---")
-final_model.save('ids_optimized_model.keras') # Save in the modern .keras format
-print("Model saved as 'ids_optimized_model.keras'")
+# --- Step 7: Save the Final Model and Artifacts ---
+print("\n--- Saving the Final Optimized Model ---")
+final_model.save('ids_final_model.keras')
+print("Model saved as 'ids_final_model.keras'")
 
 joblib.dump(scaler, 'scaler.gz')
-joblib.dump(X_train.columns, 'model_columns.pkl')
-print("Scaler and model columns saved.")
+# IMPORTANT: Save the list of SELECTED feature columns
+joblib.dump(top_n_features, 'model_columns.pkl')
+print("Scaler and SELECTED model columns saved.")
+print("\nIMPORTANT: You must update IDS.py to use the new selected columns for live analysis.")
