@@ -45,15 +45,12 @@ You have two options: use the pre-trained model for quick setup or train a new m
 This is the fastest way to get started.
 
 1.  **Download the Model Files:**
-    Within this GitHub repository. Download the following three files from the latest release:
+    With this GitHub repository comes the following three files ensure they are in the root directory of your project.
     * `ids_model.h5`
     * `scaler.gz`
     * `model_columns.pkl`
 
-2.  **Place the Files:**
-    Move these three files into the root directory of the project you just cloned.
-
-3.  **You're Ready!**
+2.  **You're Ready!**
     You can now skip to the [**Usage**](#usage) section to start the live analysis.
 
 ***
