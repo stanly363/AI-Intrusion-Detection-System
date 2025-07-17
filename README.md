@@ -45,7 +45,7 @@ You have two options: use the pre-trained model for quick setup or train a new m
 This is the fastest way to get started.
 
 1.  **Download the Model Files:**
-    Go to the **Releases** page of this GitHub repository. Download the following three files from the latest release:
+    Within this GitHub repository. Download the following three files from the latest release:
     * `ids_model.h5`
     * `scaler.gz`
     * `model_columns.pkl`
