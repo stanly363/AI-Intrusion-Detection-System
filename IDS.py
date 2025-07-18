@@ -13,7 +13,7 @@ from threading import Thread
 # --- Load Model and Preprocessing Artifacts ---
 print("--- Loading model and preprocessing artifacts ---")
 try:
-    model = tf.keras.models.load_model('ids_model.h5')
+    model = tf.keras.models.load_model('ids_final_model.keras')
     scaler = joblib.load('scaler.gz')
     model_columns = joblib.load('model_columns.pkl')
     print("Artifacts loaded successfully.")
