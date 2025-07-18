@@ -6,18 +6,25 @@ This project provides an advanced AI-based Intrusion Detection System (IDS) buil
 
 The system is composed of two main scripts:
 * `AITrain.py`: A script to automatically download the dataset, preprocess it, perform feature selection, and train a hyperparameter-tuned neural network.
-* `IDS.py`: A script that uses the trained model to monitor a live network interface and alert on suspicious activity.
+* `IDS.py`: A script that uses a trained model to monitor a live network interface and alert on suspicious activity.
 
 ---
 
-## Features ✨
+## Project Structure
 
-* **Advanced Trainable Model:** Automatically downloads the UNSW-NB15 dataset and trains a deep learning model using sophisticated techniques like feature selection and hyperparameter tuning.
-* **Optimized Predictions:** Uses a dynamically calculated prediction threshold to balance precision and recall, leading to more accurate alerts.
-* **Live Analysis:** Captures live network traffic using Scapy from any network interface.
-* **Real-time Alerts:** Reconstructs network flows on the fly and provides instant, color-coded console alerts for detected malicious activity.
-* **Cross-Platform:** Includes specific configurations and instructions for running on Windows, macOS, and Linux.
-* **Pre-trained Option:** Easily use a pre-trained model to start analyzing traffic immediately.
+The project uses the following directory structure. The `pretrained/` folder contains a ready-to-use model and its associated files.
+
+```
+/ai-intrusion-detection-system
+|-- /pretrained
+|   |-- ids_final_model.keras
+|   |-- scaler.gz
+|   |-- model_columns.pkl
+|   |-- best_threshold.pkl
+|-- AITrain.py
+|-- IDS.py
+|-- README.md
+```
 
 ---
 
@@ -46,29 +53,9 @@ You must install **Npcap** for packet capturing to work.
     * **"Support raw 802.11 traffic (and monitor mode)"**
     * **"Install Npcap in WinPcap API-compatible Mode"**
 
-### 2. Choose Your Path
+### 2. Training a New Model (Optional)
 
-You have two options: use the pre-trained model for a quick setup or train a new model from scratch.
-
-#### Option A: Use the Pre-trained Model (Recommended)
-
-This is the fastest way to get started.
-
-1.  **Verify the Model Files:**
-    Ensure the following **four** files are present in the project's root directory:
-    * `ids_final_model.keras`
-    * `scaler.gz`
-    * `model_columns.pkl`
-    * `best_threshold.pkl`
-
-2.  **You're Ready!**
-    You can now skip to the [**Usage**](#usage) section to start the live analysis.
-
-***
-
-#### Option B: Train Your Own Model
-
-Follow these steps if you want to train the model from scratch.
+While a high-performance pre-trained model is provided, you can also train your own model from scratch by following these steps.
 
 1.  **Kaggle API Credentials:**
     The training script needs Kaggle credentials to download the dataset.
@@ -77,49 +64,55 @@ Follow these steps if you want to train the model from scratch.
     * The script will prompt for your Kaggle username and API key from this file when you first run it.
 
 2.  **Run the Training Script:**
-    Execute the `AITrain.py` script from your terminal:
+    Execute the `AITrain.py` script from your terminal. This will create a new set of four model files in the project's root directory.
     ```bash
     python AITrain.py
     ```
-    The script will handle everything: downloading data, preprocessing, training the advanced model, and saving the four required artifact files (`ids_final_model.keras`, `scaler.gz`, `model_columns.pkl`, and `best_threshold.pkl`) in the project directory.
 
 ---
 
 ## Usage
 
-The script needs root/administrator privileges to capture network packets and requires you to specify which network interface to monitor.
+The script needs root/administrator privileges and a network interface to monitor. You can choose to use the included pre-trained model or a model you have trained yourself.
 
-### For Linux & macOS
+### Using the Pre-Trained Model (Recommended)
+To use the high-performance model included in the `pretrained/` folder, add the `--use-pretrained` flag to the command.
 
-1.  **Find your interface name** using commands like `ifconfig` or `ip a`. Common names are `eth0` (wired) or `en0`, `wlan0` (wireless).
+**On Linux/macOS:**
+```bash
+# Example using a wired interface
+sudo python IDS.py --interface eth0 --use-pretrained
+```
 
-2.  **Run the script** from your terminal using `sudo`:
-    ```bash
-    # Example for a wired interface
-    sudo python IDS.py --interface eth0
+**On Windows (as Administrator):**
+```powershell
+# Example using a Wi-Fi interface
+python IDS.py --interface "Wi-Fi" --use-pretrained
+```
 
-    # Example for a wireless interface
-    sudo python IDS.py --interface wlan0
-    ```
+### Using a Self-Trained Model
+If you have run `AITrain.py` and have your own set of model files in the project's root directory, simply run the command **without** the `--use-pretrained` flag.
 
-### For Windows
+**On Linux/macOS:**
+```bash
+sudo python IDS.py --interface eth0
+```
 
-1.  **Find your interface name**. The easiest way is to run the following command in a terminal, which will list the exact names `scapy` can use:
-    ```powershell
-    python -c "from scapy.all import get_windows_if_list; print(get_windows_if_list())"
-    ```
-    Look for the `name` field of your "Wi-Fi" or "Ethernet" adapter in the output.
+**On Windows (as Administrator):**
+```powershell
+python IDS.py --interface "Wi-Fi"
+```
 
-2.  **Run the script** from a **Command Prompt or PowerShell opened as Administrator**:
-    ```powershell
-    # Example for a Wi-Fi interface (use quotes if the name has spaces)
-    python IDS.py --interface "Wi-Fi"
+---
 
-    # Example for an Ethernet interface
-    python IDS.py --interface "Ethernet"
-    ```
+## Troubleshooting
 
-The system will now start monitoring traffic and will print a real-time, color-coded alert to your console whenever it detects a malicious connection. Press `Ctrl+C` to stop the analyzer.
+**Error: `Layer ['tcp'] not found` or `Interface not found` on Windows**
+
+This is a common issue related to how packet capture libraries interact with Windows drivers. If problems persist:
+1.  **Reinstall Npcap:** Ensure you have installed Npcap with the correct settings mentioned in the prerequisites.
+2.  **Check Interface Name:** Use `python -c "from scapy.all import get_windows_if_list; print(get_windows_if_list())"` to find the exact name.
+3.  **Wi-Fi Adapter Limitations:** Most built-in laptop Wi-Fi cards do not support monitor mode on Windows. If the script fails on Wi-Fi but works on a wired Ethernet connection, this is the cause.
 
 ---
 
