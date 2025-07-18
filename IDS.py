@@ -169,10 +169,20 @@ def process_and_predict(flow_data):
         })
 
 def packet_callback(packet):
-    """Callback function for each captured packet."""
+    """
+    Callback function for each captured packet.
+    This version is more defensive to handle Windows/Scapy quirks.
+    """
+    if not packet.haslayer(IP):
+        return
+
+    if not (TCP in packet or UDP in packet):
+        return
+
     now = time.time()
     flow_id = get_flow_id(packet)
-    if not flow_id: return
+    if not flow_id:
+        return
 
     with global_lock:
         if flow_id not in active_flows:
@@ -185,27 +195,24 @@ def packet_callback(packet):
                 'flags': set(),
                 'service': service_map.get(packet[proto].dport, service_map.get(packet[proto].sport, 'others'))
             }
-        
+
         flow = active_flows[flow_id]
         flow['last_time'] = now
-        
-        # Determine direction for byte count
+
         if packet[IP].src == flow['src_ip']:
             flow['src_bytes'] += len(packet.payload)
         else:
             flow['dst_bytes'] += len(packet.payload)
-            
+
         if TCP in packet:
-            # Using scapy's string representation of flags (e.g., 'S' for SYN, 'F' for FIN)
             for flag in str(packet[TCP].flags):
                 flow['flags'].add(flag)
 
-        # Trigger analysis on flow termination (FIN or RST)
         if TCP in packet and (packet[TCP].flags.F or packet[TCP].flags.R):
-            flow_to_process = active_flows.pop(flow_id)
-            flow_to_process['duration'] = flow_to_process['last_time'] - flow_to_process['start_time']
-            # Run prediction in a new thread to avoid blocking the sniffer
-            Thread(target=process_and_predict, args=(flow_to_process,)).start()
+            flow_to_process = active_flows.pop(flow_id, None)
+            if flow_to_process:
+                flow_to_process['duration'] = flow_to_process['last_time'] - flow_to_process['start_time']
+                Thread(target=process_and_predict, args=(flow_to_process,)).start()
 
 def flow_manager():
     """A thread to manage and timeout inactive flows."""
@@ -225,23 +232,27 @@ def flow_manager():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Advanced AI-based Network Intrusion Detection System")
-    parser.add_argument('--interface', type=str, required=True, help='Network interface to sniff on (e.g., eth0, wlan0)')
+    parser.add_argument('--interface', type=str, required=True, help='Network interface to sniff on (e.g., "Wi-Fi", "Ethernet")')
     args = parser.parse_args()
 
     print(f"\n{bcolors.BOLD}--- Starting Live Network Traffic Analyzer ---{bcolors.ENDC}")
     print(f"{LOG_PREFIX} Sniffing on interface: {bcolors.OKGREEN}{args.interface}{bcolors.ENDC}")
     print(f"{LOG_PREFIX} Press {bcolors.WARNING}Ctrl+C{bcolors.ENDC} to stop.")
 
-    manager = Thread(target=flow_manager, daemon=True)
-    manager.start()
+    # Start the thread to manage timed-out flows
+    manager_thread = Thread(target=flow_manager, daemon=True)
+    manager_thread.start()
 
     try:
-        sniff(iface=args.interface, prn=packet_callback, store=0)
-    except PermissionError:
-        print(f"\n{bcolors.FAIL}{LOG_PREFIX} Permission denied. Please run this script with 'sudo'.{bcolors.ENDC}")
-    except OSError as e:
-        print(f"\n{bcolors.FAIL}{LOG_PREFIX} Error sniffing on interface '{args.interface}': {e}{bcolors.ENDC}")
-        print(f"{bcolors.WARNING}{LOG_PREFIX} Please ensure the interface name is correct and the interface is up.{bcolors.ENDC}")
+        sniff(iface=args.interface, prn=packet_callback, store=False, filter="")
+    except (PermissionError, OSError):
+         print(f"\n{bcolors.FAIL}{LOG_PREFIX} Permission denied or interface error. Please run this script from a Command Prompt with 'Run as administrator'.{bcolors.ENDC}")
+    except RuntimeError as e:
+        if "not found" in str(e):
+             print(f"\n{bcolors.FAIL}{LOG_PREFIX} Interface '{args.interface}' not found!{bcolors.ENDC}")
+             print(f"{bcolors.WARNING}{LOG_PREFIX} Please run 'python find_interfaces.py' to see the list of correct interface names.{bcolors.ENDC}")
+        else:
+            print(f"\n{bcolors.FAIL}{LOG_PREFIX} A runtime error occurred: {e}{bcolors.ENDC}")
     except Exception as e:
         print(f"\n{bcolors.FAIL}{LOG_PREFIX} An unexpected error occurred: {e}{bcolors.ENDC}")
     finally:
