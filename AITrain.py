@@ -14,6 +14,17 @@ import warnings
 import joblib
 import keras_tuner as kt
 
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 print("TensorFlow Version:", tf.__version__)
@@ -208,12 +219,23 @@ plt.show()
 
 
 # --- Step 7: Save the Final Model and Artifacts ---
-print("\n--- Saving the Final Optimized Model ---")
+print("\n--- Saving the Final Optimized Model and Artifacts ---")
+
+# Save the TensorFlow/Keras model
 final_model.save('ids_final_model.keras')
 print("Model saved as 'ids_final_model.keras'")
 
+# Save the scaler
 joblib.dump(scaler, 'scaler.gz')
-# IMPORTANT: Save the list of SELECTED feature columns
+print("Scaler saved as 'scaler.gz'")
+
+# Save the list of selected feature columns
 joblib.dump(top_n_features, 'model_columns.pkl')
-print("Scaler and SELECTED model columns saved.")
-print("\nIMPORTANT: You must update IDS.py to use the new selected columns for live analysis.")
+print("Model columns saved as 'model_columns.pkl'")
+
+# --- THIS IS THE NEW LINE ---
+# Save the best threshold for predictions
+joblib.dump(best_threshold, 'best_threshold.pkl')
+print(f"Optimal prediction threshold saved as 'best_threshold.pkl'")
+
+print(f"\n{bcolors.OKGREEN}All artifacts have been saved successfully! You are now ready to run the live analyzer.{bcolors.ENDC}")
