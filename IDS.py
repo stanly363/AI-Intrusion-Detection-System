@@ -1,4 +1,4 @@
-
+# live_ids_compatible.py
 # --- Live IDS: Step 0: Import necessary libraries ---
 import tensorflow as tf
 import joblib
@@ -198,11 +198,23 @@ def extract_combined_features(packet, packet_timestamp):
     return combined_features
 
 
+# Global variables to hold loaded models and artifacts
+# These are initialized to None and will be populated by load_ids_artifacts
+final_model = None
+scaler = None
+required_feature_names = None
+best_threshold = None
+
 # --- Live IDS: Step 1: Load the saved models and artifacts ---
 def load_ids_artifacts(model_path_prefix=""):
     """
-    Loads the IDS model and associated artifacts from the specified path prefix.
+    Loads the IDS model and associated artifacts from the specified path prefix
+    and assigns them to global variables.
     """
+    # Declare variables as global so assignments within this function
+    # modify the global scope variables, not create new local ones.
+    global final_model, scaler, required_feature_names, best_threshold 
+    
     print("--- Loading IDS Artifacts ---")
     try:
         final_model = tf.keras.models.load_model(os.path.join(model_path_prefix, 'ids_live_compatible_model.keras'))
@@ -225,19 +237,13 @@ def load_ids_artifacts(model_path_prefix=""):
         print(f"Number of required_feature_names: {len(required_feature_names)}")
         # --- DEBUGGING ADDITION END ---
         
-        return final_model, scaler, required_feature_names, best_threshold
+        # No return statement needed here as we are assigning directly to globals
+        # The variables final_model, scaler, etc. are now populated globally.
 
     except Exception as e:
         print(f"{bcolors.FAIL}Error loading artifacts from '{model_path_prefix}': {e}{bcolors.ENDC}")
         print(f"Please ensure the necessary files are in the '{model_path_prefix}' directory: 'ids_live_compatible_model.keras', 'scaler_live_compatible.gz', 'model_columns_live_compatible.pkl', and 'best_threshold_live_compatible.pkl'.")
         sys.exit(1)
-
-
-# Global variables to hold loaded models and artifacts
-final_model = None
-scaler = None
-required_feature_names = None
-best_threshold = None
 
 
 # --- Live IDS: Step 2: Define packet processing callback function ---
@@ -350,13 +356,15 @@ if __name__ == "__main__":
     model_load_path = ""
     if args.pretrained:
         model_load_path = "pretrained"
-        # Create the 'pretrained' directory if it doesn't exist
+        # Create the 'pretrained' directory if it doesn't exist.
+        # This check is primarily to provide a helpful error message if the user specifies --pretrained
+        # but the directory is missing.
         if not os.path.exists(model_load_path):
             print(f"{bcolors.FAIL}Error: Pretrained models directory '{model_load_path}' not found.{bcolors.ENDC}")
             sys.exit(1)
     
-    # Load models and artifacts based on the chosen path
-    global final_model, scaler, required_feature_names, best_threshold
-    final_model, scaler, required_feature_names, best_threshold = load_ids_artifacts(model_load_path)
+    # Load models and artifacts based on the chosen path.
+    # The load_ids_artifacts function now handles assigning to global variables directly.
+    load_ids_artifacts(model_load_path)
 
     start_live_ids(interface=network_interface)
