@@ -1,25 +1,20 @@
-# IDS.py - Final Hardened Version with Pre-trained Flag for Jetson Nano
-
-import time
-import joblib
-import numpy as np
-import pandas as pd
+# live_ids_compatible.py
+# --- Live IDS: Step 0: Import necessary libraries ---
 import tensorflow as tf
-import argparse
+import joblib
+import pandas as pd
+import numpy as np
+from scapy.all import sniff, IP, TCP, UDP, ICMP, Raw # For live packet capture
+import time # For current timestamp
+import datetime # For display purposes
+import warnings
 import sys
-import os
-from collections import deque, defaultdict
-from threading import Thread, RLock
-from scapy.config import conf
-# --- Scapy Imports ---
-from scapy.all import sniff, IP, TCP, UDP, L3RawSocket
+from collections import defaultdict, deque # For micro-flow tracking
 
-# --- Configuration ---
-FLOW_TIMEOUT = 120  # seconds to wait before a flow is considered inactive
-HISTORY_MAXLEN = 500 # Max number of recent connections to store for feature calculation
-LOG_PREFIX = "[IDS]"
+# Suppress scapy warnings (e.g., No route found)
+warnings.filterwarnings('ignore', category=UserWarning, module='scapy')
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='scapy')
 
-# --- Color Codes for Alerts ---
 class bcolors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
@@ -31,256 +26,307 @@ class bcolors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-# --- Argument Parsing ---
-parser = argparse.ArgumentParser(description="Advanced AI-based Network Intrusion Detection System")
-# Hint for Jetson Nano users: common interfaces are eth0, wlan0
-parser.add_argument('--interface', type=str, required=True, help='Network interface to sniff on (e.g., "eth0", "wlan0")')
-parser.add_argument('--use-pretrained', action='store_true', help='Use the pre-trained model from the "pretrained" folder.')
-args = parser.parse_args()
+# --- Micro-Flow Configuration (MUST MATCH TRAINER'S) ---
+MICRO_FLOW_WINDOW_SEC = 2.0 # Time window for micro-flow aggregation
 
-# --- Load Model and Preprocessing Artifacts ---
-# Determine the path to the model files based on the flag
-if args.use_pretrained:
-    model_dir = 'pretrained'
-    print(f"{bcolors.HEADER}{LOG_PREFIX} Loading PRE-TRAINED model and artifacts from '{model_dir}/'...{bcolors.ENDC}")
-else:
-    model_dir = ''
-    print(f"{bcolors.HEADER}{LOG_PREFIX} Loading self-trained model and artifacts from the project root...{bcolors.ENDC}")
+# MicroFlowInfo and MicroFlowManager MUST BE IDENTICAL TO TRAINER'S
+class MicroFlowInfo:
+    """Stores information for a single micro-flow."""
+    def __init__(self, start_time):
+        self.start_time = start_time
+        self.last_packet_time = start_time
+        self.packet_data = deque([(start_time, 0, 0, False)]) # (timestamp, size, dst_port, is_syn)
+        
+    def update(self, current_time, dst_port, packet_size, is_syn):
+        self.last_packet_time = current_time
+        self.packet_data.append((current_time, packet_size, dst_port, is_syn))
+        while self.packet_data and (current_time - self.packet_data[0][0]) > MICRO_FLOW_WINDOW_SEC:
+            self.packet_data.popleft()
+        
+        self.pkt_count = len(self.packet_data)
+        self.byte_count = sum(data[1] for data in self.packet_data)
+        self.unique_dst_ports = {data[2] for data in self.packet_data}
+        self.syn_count = sum(1 for data in self.packet_data if data[3])
+    
+    def get_features(self):
+        if self.packet_data:
+            micro_flow_duration_actual = self.packet_data[-1][0] - self.packet_data[0][0]
+            if micro_flow_duration_actual == 0: micro_flow_duration_actual = 1e-6
+        else:
+            micro_flow_duration_actual = 1e-6
 
+        return {
+            'micro_flow_pkt_count': self.pkt_count,
+            'micro_flow_byte_count': self.byte_count,
+            'micro_flow_unique_dst_ports': len(self.unique_dst_ports),
+            'micro_flow_syn_count': self.syn_count,
+            'micro_flow_duration': micro_flow_duration_actual,
+            'micro_flow_rate': self.pkt_count / micro_flow_duration_actual if micro_flow_duration_actual > 0 else 0
+        }
+
+class MicroFlowManager:
+    """Manages multiple active micro-flows."""
+    def __init__(self, window_size=MICRO_FLOW_WINDOW_SEC):
+        self.flows = defaultdict(lambda: None) 
+        self.window_size = window_size
+
+    def _get_flow_key(self, src_ip, dst_ip, proto_num):
+        if src_ip < dst_ip:
+            return (src_ip, dst_ip, proto_num)
+        else:
+            return (dst_ip, src_ip, proto_num)
+
+    def update_and_get_features(self, packet, packet_timestamp):
+        if not IP in packet:
+            return None, None
+
+        src_ip = packet[IP].src
+        dst_ip = packet[IP].dst
+        proto_num = packet[IP].proto
+        dst_port = 0
+        is_syn = False
+
+        if TCP in packet:
+            dst_port = packet[TCP].dport
+            if packet[TCP].flags and 'S' in str(packet[TCP].flags):
+                is_syn = True
+        elif UDP in packet:
+            dst_port = packet[UDP].dport
+
+        flow_key = self._get_flow_key(src_ip, dst_ip, proto_num)
+        packet_size = len(packet)
+
+        if self.flows[flow_key] is None:
+            self.flows[flow_key] = MicroFlowInfo(packet_timestamp)
+        
+        self.flows[flow_key].update(packet_timestamp, dst_port, packet_size, is_syn)
+        
+        flows_to_prune = []
+        for key, flow_info in list(self.flows.items()):
+            if flow_info and (packet_timestamp - flow_info.last_packet_time) > self.window_size * 2:
+                flows_to_prune.append(key)
+        for key in flows_to_prune:
+            del self.flows[key]
+
+        return flow_key, self.flows[flow_key].get_features()
+
+# Instantiate the MicroFlowManager for live processing
+micro_flow_manager_live = MicroFlowManager()
+
+
+# --- Feature Extraction Function (Packet-Level + Micro-Flow) ---
+# THIS FUNCTION MUST BE IDENTICAL TO THE ONE IN THE TRAINER!
+def extract_combined_features(packet, packet_timestamp):
+    """
+    Extracts basic packet features and augments them with micro-flow features.
+    This function MUST EXACTLY MATCH the one used in the trainer script.
+    """
+    packet_features = {}
+    packet_features['ip_len'] = 0
+    packet_features['ip_ttl'] = 0
+    packet_features['ip_id'] = 0
+    packet_features['ip_flags_DF'] = 0
+    packet_features['ip_flags_MF'] = 0
+    packet_features['tcp_sport'] = 0
+    packet_features['tcp_dport'] = 0
+    packet_features['tcp_flags_SYN'] = 0
+    packet_features['tcp_flags_ACK'] = 0
+    packet_features['tcp_flags_FIN'] = 0
+    packet_features['tcp_flags_RST'] = 0
+    packet_features['tcp_flags_PSH'] = 0
+    packet_features['tcp_flags_URG'] = 0
+    packet_features['tcp_window'] = 0
+    packet_features['udp_sport'] = 0
+    packet_features['udp_dport'] = 0
+    packet_features['udp_len'] = 0
+    packet_features['icmp_type'] = 0
+    packet_features['icmp_code'] = 0
+    packet_features['packet_size'] = len(packet)
+    packet_features['payload_len'] = 0
+    packet_features['proto_num'] = 0
+
+    if IP in packet:
+        packet_features['ip_len'] = packet[IP].len
+        packet_features['ip_ttl'] = packet[IP].ttl
+        packet_features['ip_id'] = packet[IP].id
+        if packet[IP].flags:
+            if 'DF' in str(packet[IP].flags): packet_features['ip_flags_DF'] = 1
+            if 'MF' in str(packet[IP].flags): packet_features['ip_flags_MF'] = 1
+        
+        packet_features['proto_num'] = packet[IP].proto
+
+    # Ensure to check if TCP/UDP/ICMP layers exist before trying to access their fields
+    if TCP in packet:
+        packet_features['tcp_sport'] = packet[TCP].sport
+        packet_features['tcp_dport'] = packet[TCP].dport
+        flags = str(packet[TCP].flags)
+        if 'S' in flags: packet_features['tcp_flags_SYN'] = 1
+        if 'A' in flags: packet_features['tcp_flags_ACK'] = 1
+        if 'F' in flags: packet_features['tcp_flags_FIN'] = 1
+        if 'R' in flags: packet_features['tcp_flags_RST'] = 1
+        if 'P' in flags: packet_features['tcp_flags_PSH'] = 1
+        if 'U' in flags: packet_features['tcp_flags_URG'] = 1
+        packet_features['tcp_window'] = packet[TCP].window
+        if Raw in packet:
+            packet_features['payload_len'] = len(packet[Raw].load)
+
+    elif UDP in packet:
+        packet_features['udp_sport'] = packet[UDP].sport
+        packet_features['udp_dport'] = packet[UDP].dport
+        packet_features['udp_len'] = packet[UDP].len
+        if Raw in packet:
+            packet_features['payload_len'] = len(packet[Raw].load)
+
+    elif ICMP in packet:
+        packet_features['icmp_type'] = packet[ICMP].type
+        packet_features['icmp_code'] = packet[ICMP].code
+        if Raw in packet:
+            packet_features['payload_len'] = len(packet[Raw].load)
+    
+    _ , micro_features = micro_flow_manager_live.update_and_get_features(packet, packet_timestamp)
+    
+    if micro_features is None: 
+        micro_features = {
+            'micro_flow_pkt_count': 0, 'micro_flow_byte_count': 0,
+            'micro_flow_unique_dst_ports': 0, 'micro_flow_syn_count': 0,
+            'micro_flow_duration': 0.0, 'micro_flow_rate': 0.0
+        }
+    
+    combined_features = {**packet_features, **micro_features}
+    return combined_features
+
+
+# --- Live IDS: Step 1: Load the saved models and artifacts ---
+print("--- Loading IDS Artifacts ---")
 try:
-    model_path = os.path.join(model_dir, 'ids_final_model.keras')
-    scaler_path = os.path.join(model_dir, 'scaler.gz')
-    columns_path = os.path.join(model_dir, 'model_columns.pkl')
-    threshold_path = os.path.join(model_dir, 'best_threshold.pkl')
-
-    model = tf.keras.models.load_model(model_path)
-    scaler = joblib.load(scaler_path)
-    model_columns = joblib.load(columns_path)
-    best_threshold = joblib.load(threshold_path)
+    final_model = tf.keras.models.load_model('ids_live_compatible_model.keras')
+    scaler = joblib.load('scaler_live_compatible.gz')
+    model_columns = joblib.load('model_columns_live_compatible.pkl')
     
-    print(f"{bcolors.OKGREEN}{LOG_PREFIX} Artifacts loaded successfully.{bcolors.ENDC}")
-    print(f"{bcolors.OKCYAN}{LOG_PREFIX} Using optimal prediction threshold: {best_threshold:.4f}{bcolors.ENDC}")
+    # Load the best threshold found during training
+    best_threshold_from_training = joblib.load('best_threshold_live_compatible.pkl')
+    
+    # --- MANUAL THRESHOLD ADJUSTMENT FOR TESTING ---
+    # best_threshold = 0.5 # Example
+    best_threshold = best_threshold_from_training # Keep this line if you want to use the F1-optimized threshold
 
-except FileNotFoundError as e:
-    print(f"{bcolors.FAIL}{LOG_PREFIX} Error: Could not load required file. {e}{bcolors.ENDC}")
-    if args.use_pretrained:
-        print(f"{bcolors.FAIL}{LOG_PREFIX} Ensure the 'pretrained' folder exists and contains all four model files.{bcolors.ENDC}")
-    else:
-        print(f"{bcolors.FAIL}{LOG_PREFIX} Please run AITrain.py to generate the required model and artifact files in the root directory.{bcolors.ENDC}")
-    exit()
+    # This list will contain the *exact* feature names and order that the model was trained on.
+    required_feature_names = model_columns 
+
+    print(f"{bcolors.OKGREEN}Models and artifacts loaded successfully!{bcolors.ENDC}")
+    print(f"Optimal Prediction Threshold: {best_threshold:.4f} (Originally optimized to: {best_threshold_from_training:.4f})")
+
+    # --- DEBUGGING ADDITION START ---
+    print(f"\n{bcolors.OKBLUE}DEBUG (Live IDS): `required_feature_names` loaded from model_columns.pkl:{bcolors.ENDC}")
+    print(required_feature_names)
+    print(f"Number of required_feature_names: {len(required_feature_names)}")
+    # --- DEBUGGING ADDITION END ---
+
 except Exception as e:
-    print(f"{bcolors.FAIL}{LOG_PREFIX} An unexpected error occurred during artifact loading: {e}{bcolors.ENDC}")
-    exit()
+    print(f"{bcolors.FAIL}Error loading artifacts: {e}{bcolors.ENDC}")
+    print("Please ensure 'ids_live_compatible_model.keras', 'scaler_live_compatible.gz', 'model_columns_live_compatible.pkl', and 'best_threshold_live_compatible.pkl' are in the same directory and generated by the latest trainer script.")
+    sys.exit(1)
 
-# --- Global State with Thread-Safe Locks ---
-active_flows = {}
-connection_history = deque(maxlen=HISTORY_MAXLEN)
-global_lock = RLock()
 
-# --- Expanded Service Port Mapping ---
-service_map = {
-    80: 'http', 21: 'ftp', 22: 'ssh', 23: 'telnet', 25: 'smtp', 53: 'dns',
-    443: 'https', 110: 'pop3', 143: 'imap', 123: 'ntp', 3389: 'rdp',
-    137: 'netbios-ns', 139: 'netbios-ssn', 445: 'microsoft-ds', 67: 'dhcp',
-    161: 'snmp', 5060: 'sip', 389: 'ldap', 993: 'imaps', 995: 'pop3s'
-}
-
-def get_flow_id(packet):
-    # This function remains the same as it operates on parsed Scapy packet layers
-    if IP in packet and (TCP in packet or UDP in packet):
-        protocol = 'tcp' if TCP in packet else 'udp'
-        # Sort tuple to ensure flow_id is consistent regardless of src/dst order
-        return tuple(sorted(((packet[IP].src, packet[protocol].sport), (packet[IP].dst, packet[protocol].dport))))
-    return None
-
-def extract_features(flow_data, now):
-    # This function remains the same as it operates on extracted flow_data
-    features = defaultdict(float)
-    features['dur'] = flow_data['duration']
-    features['sbytes'] = flow_data['src_bytes']
-    features['dbytes'] = flow_data['dst_bytes']
-    features['land'] = 1 if flow_data['src_ip'] == flow_data['dst_ip'] else 0
-    service = flow_data['service']
-    proto = flow_data['protocol']
-    features[f'proto_{proto}'] = 1.0
-    features[f'service_{service}'] = 1.0
-    flags = flow_data['flags']
-    state = "FIN" if 'F' in flags else "RST" if 'R' in flags else "CON" if 'S' in flags and 'A' in flags else "REQ" if 'S' in flags else "INT"
-    features[f'state_{state}'] = 1.0
-
-    with global_lock:
-        # Calculate features based on recent connection history
-        recent_conns_2s = [c for c in connection_history if now - c['timestamp'] <= 2]
-        dst_host_conns_100 = [c for c in connection_history if c['dst_host'] == flow_data['dst_ip']]
-
-    features['count'] = sum(1 for c in recent_conns_2s if c['dst_host'] == flow_data['dst_ip'])
-    features['srv_count'] = sum(1 for c in recent_conns_2s if c['dst_host'] == flow_data['dst_ip'] and c['service'] == service)
-    features['dst_host_count'] = len(dst_host_conns_100)
-    features['dst_host_srv_count'] = sum(1 for c in dst_host_conns_100 if c['service'] == service)
-
-    if features['dst_host_count'] > 0:
-        features['dst_host_same_srv_rate'] = features['dst_host_srv_count'] / features['dst_host_count']
-        diff_srv_count = sum(1 for c in dst_host_conns_100 if c['service'] != service)
-        features['dst_host_diff_srv_rate'] = diff_srv_count / features['dst_host_count']
-        same_src_port_count = sum(1 for c in dst_host_conns_100 if c['src_port'] == flow_data['src_port'])
-        features['dst_host_same_src_port_rate'] = same_src_port_count / features['dst_host_count']
-    return features
-
-def process_and_predict(flow_data):
-    # This function remains the same as it processes flow_data and interacts with the model
-    now = time.time()
-    features = extract_features(flow_data, now)
-    live_df = pd.DataFrame([features])
-    live_df_aligned = live_df.reindex(columns=model_columns, fill_value=0.0)
+# --- Live IDS: Step 2: Define packet processing callback function ---
+def process_packet(packet):
+    current_time_unix = time.time() # Use Unix timestamp for consistency with packet.time in trainer
+    current_time_display = datetime.datetime.fromtimestamp(current_time_unix)
     
-    # Identify numerical columns for scaling
-    numerical_cols = [col for col in model_columns if not col.startswith(('proto_', 'service_', 'state_'))]
-    cols_to_scale = [col for col in numerical_cols if col in live_df_aligned.columns]
-    
-    if cols_to_scale:
-        live_df_aligned[cols_to_scale] = scaler.transform(live_df_aligned[cols_to_scale])
-    
-    try:
-        prediction_prob = model.predict(live_df_aligned, verbose=0)[0][0]
-        is_malicious = prediction_prob > best_threshold
-    except Exception as e:
-        print(f"{bcolors.WARNING}{LOG_PREFIX} Prediction error: {e}{bcolors.ENDC}")
+    # Filter out non-IP packets early, as our features rely on IP and higher layers
+    if not IP in packet:
         return
-    
-    if is_malicious:
-        alert_message = (
-            f"\n{bcolors.FAIL}{bcolors.BOLD}================[ MALICIOUS ACTIVITY DETECTED ]================{bcolors.ENDC}\n"
-            f"{bcolors.FAIL} Flow            : {flow_data['src_ip']}:{flow_data['src_port']} -> {flow_data['dst_ip']}:{flow_data['dst_port']}\n"
-            f" Protocol        : {flow_data['protocol'].upper()} ({flow_data['service']})\n"
-            f" Duration        : {flow_data['duration']:.4f}s\n"
-            f" Confidence      : {prediction_prob:.2%}\n"
-            f" Classification  : MALICIOUS (Threshold: {best_threshold:.2f})\n"
-            f"==============================================================={bcolors.ENDC}"
-        )
-        print(alert_message)
-    
-    with global_lock:
-        # Add connection to history for rate-based feature calculation
-        connection_history.append({'timestamp': now, 'dst_host': flow_data['dst_ip'], 'src_port': flow_data['src_port'], 'service': flow_data['service']})
-
-def packet_callback(packet):
-    """
-    Callback function for sniff().
-    Processes each captured packet to extract flow data and trigger prediction.
-    Now includes a try-except block to gracefully handle malformed packets.
-    """
+        
     try:
-        # Check for IP layer, as L3RawSocket only captures IP packets
-        if not packet.haslayer(IP):
-            return
+        # Extract combined features (packet + micro-flow)
+        raw_features = extract_combined_features(packet, current_time_unix)
+        
+        # Create a DataFrame from the extracted features
+        extracted_df = pd.DataFrame([raw_features])
+        
+        # Ensure all required_feature_names (which are `model_columns`) are present.
+        # Initialize a DataFrame with zeros for all required features.
+        features_to_scale = pd.DataFrame(0.0, index=[0], columns=required_feature_names)
+        
+        # Copy values from the extracted features into the aligned DataFrame
+        for col in extracted_df.columns:
+            if col in features_to_scale.columns:
+                features_to_scale[col] = extracted_df[col]
 
-        proto = None
-        if packet.haslayer(TCP):
-            proto = 'tcp'
-        elif packet.haslayer(UDP):
-            proto = 'udp'
-        else:
-            # If it's an IP packet but neither TCP nor UDP (e.g., ICMP), skip for now
-            # You could extend this to handle other protocols if your model supports them
-            return
+        # Check for any NaN values before scaling (a sanity check)
+        if features_to_scale.isnull().any().any():
+            print(f"{bcolors.FAIL}DEBUG (Live IDS): NaN values detected in features_to_scale BEFORE scaling! This is unexpected.{bcolors.ENDC}")
 
-        now = time.time()
-        flow_id = get_flow_id(packet)
-        if not flow_id:
-            return # Should not happen if IP, TCP/UDP are present
+        # Apply scaling
+        features_df_scaled = scaler.transform(features_to_scale)
+        
+        # Make prediction
+        prediction_prob = final_model.predict(features_df_scaled, verbose=0)[0][0] 
+        prediction_label = "ATTACK" if prediction_prob > best_threshold else "NORMAL"
 
-        with global_lock:
-            # Initialize or update flow data
-            if flow_id not in active_flows:
-                active_flows[flow_id] = {
-                    'start_time': now,
-                    'src_ip': packet[IP].src,
-                    'dst_ip': packet[IP].dst,
-                    'src_port': packet[proto].sport,
-                    'dst_port': packet[proto].dport,
-                    'protocol': proto,
-                    'src_bytes': 0,
-                    'dst_bytes': 0,
-                    'flags': set(),
-                    'service': service_map.get(packet[proto].dport, service_map.get(packet[proto].sport, 'others'))
-                }
+        # --- MODIFIED PRINT LOGIC: Only print for ATTACK detections ---
+        if prediction_label == "ATTACK":
+            status_color = bcolors.FAIL # Attack is always red
+            
+            src_ip = packet[IP].src
+            dst_ip = packet[IP].dst
+            protocol_name_display = {6: 'TCP', 17: 'UDP', 1: 'ICMP'}.get(packet[IP].proto, 'OTHER')
 
-            flow = active_flows[flow_id]
-            flow['last_time'] = now
+            print(f"[{current_time_display.strftime('%Y-%m-%d %H:%M:%S')}] "
+                  f"[{status_color}{prediction_label}{bcolors.ENDC}] "
+                  f"Packet: {src_ip} -> {dst_ip} (Proto: {protocol_name_display}) | "
+                  f"Size: {len(packet)} bytes | "
+                  f"Prob: {prediction_prob:.4f})")
+            print(f"{bcolors.WARNING}!!! POTENTIAL INTRUSION DETECTED !!! (Packet from {src_ip}){bcolors.ENDC}")
+            # Add your alerting mechanism here: logging, notifications, SIEM integration
+        # --- END MODIFIED PRINT LOGIC ---
 
-            # Update byte counts
-            if packet[IP].src == flow['src_ip']:
-                flow['src_bytes'] += len(packet.payload)
-            else:
-                flow['dst_bytes'] += len(packet.payload)
-
-            # Update TCP flags if applicable
-            if proto == 'tcp' and TCP in packet: # Ensure it's TCP before accessing flags
-                for flag in str(packet[TCP].flags):
-                    flow['flags'].add(flag)
-                
-                # If TCP connection is finishing (FIN or RST flag), process the flow
-                if packet[TCP].flags.F or packet[TCP].flags.R:
-                    flow_to_process = active_flows.pop(flow_id, None)
-                    if flow_to_process:
-                        flow_to_process['duration'] = flow_to_process['last_time'] - flow_to_process['start_time']
-                        Thread(target=process_and_predict, args=(flow_to_process,)).start()
     except Exception as e:
-        # Catch any unexpected errors during packet processing to prevent sniffer from crashing
-        print(f"{bcolors.WARNING}{LOG_PREFIX} Skipping malformed or unprocessable packet: {e}{bcolors.ENDC}")
+        # Catch any errors during feature extraction, scaling, or prediction for a single packet
+        # This allows the IDS to continue processing even if one packet causes an issue.
+        src_ip_str = packet[IP].src if IP in packet else "N/A"
+        dst_ip_str = packet[IP].dst if IP in packet else "N/A"
+        print(f"[{current_time_display.strftime('%Y-%m-%d %H:%M:%S')}] {bcolors.FAIL}Error processing packet from {src_ip_str} to {dst_ip_str}: {e}{bcolors.ENDC}")
+        # Consider adding more specific error logging here for analysis.
 
-def flow_manager():
-    """Manages and times out inactive flows."""
-    while True:
-        time.sleep(15) # Check for timeouts every 15 seconds
-        now = time.time()
-        with global_lock:
-            # Identify flows that have been inactive for longer than FLOW_TIMEOUT
-            timed_out_ids = [fid for fid, flow in active_flows.items() if now - flow['last_time'] > FLOW_TIMEOUT]
-            for fid in timed_out_ids:
-                flow_data = active_flows.pop(fid, None) # Remove from active flows
-                if flow_data:
-                    # Calculate duration for timed-out flows
-                    flow_data['duration'] = flow_data['last_time'] - flow_data['start_time']
-                    print(f"{bcolors.OKCYAN}{LOG_PREFIX} Flow timed out. Analyzing {flow_data['src_ip']} -> {flow_data['dst_ip']}...{bcolors.ENDC}")
-                    # Process and predict in a separate thread to avoid blocking
-                    Thread(target=process_and_predict, args=(flow_data,)).start()
-
-if __name__ == '__main__':
-    print(f"\n{bcolors.BOLD}--- Starting Live Network Traffic Analyzer ---{bcolors.ENDC}")
-    print(f"{LOG_PREFIX} Sniffing on interface: {bcolors.OKGREEN}{args.interface}{bcolors.ENDC}")
-    print(f"{LOG_PREFIX} Press {bcolors.WARNING}Ctrl+C{bcolors.ENDC} to stop.")
-    
-    # --- IMPORTANT FOR JETSON NANO / LINUX L3 SNIFFING ---
-    # Force Scapy to use L3RawSocket for sniffing. This operates at the IP layer
-    # and can sometimes bypass issues with L2 (Ethernet) sniffing on certain devices.
-    conf.L3socket = L3RawSocket
-    print(f"{LOG_PREFIX} Using L3RawSocket for sniffing (IP layer).")
-    
-    # Optional: Still attempt to force pcap usage, though L3RawSocket might override some L2 pcap behavior
-    conf.use_pcap = True
-    print(f"{LOG_PREFIX} Attempting to force pcap usage for Scapy (secondary).")
-
-    manager_thread = Thread(target=flow_manager, daemon=True)
-    manager_thread.start()
-    try:
-        # Sniffing with L3RawSocket. Filter can still be applied at IP level.
-        sniff(
-            iface=args.interface,
-            prn=packet_callback,
-            store=False,
-            filter="ip" # Filter for IP packets, as L3RawSocket handles IP layer and above
-        )
-    except (PermissionError, OSError):
-         # Updated message for Linux/Ubuntu
-         print(f"\n{bcolors.FAIL}{LOG_PREFIX} Permission denied. Please run this script with 'sudo'.{bcolors.ENDC}")
-    except RuntimeError as e:
-        if "not found" in str(e):
-             # Updated message for Linux/Ubuntu
-             print(f"\n{bcolors.FAIL}{LOG_PREFIX} Interface '{args.interface}' not found! Check 'ifconfig' or 'ip a' for available interfaces.{bcolors.ENDC}")
-        else:
-            print(f"\n{bcolors.FAIL}{LOG_PREFIX} A runtime error occurred: {e}{bcolors.ENDC}")
-    except Exception as e:
-        print(f"\n{bcolors.FAIL}{LOG_PREFIX} An unexpected error occurred: {e}{bcolors.ENDC}")
     finally:
-        print(f"\n{bcolors.BOLD}--- Analyzer stopped ---{bcolors.ENDC}")
+        # Prune old micro-flows to prevent memory leak for long-running processes
+        # This runs regardless of whether an error occurred in packet processing.
+        global micro_flow_manager_live
+        flows_to_prune = []
+        # Iterate over a copy of items to allow modification during loop
+        for key, flow_data in list(micro_flow_manager_live.flows.items()): 
+            if flow_data and (current_time_unix - flow_data.last_packet_time) > MICRO_FLOW_WINDOW_SEC * 2: 
+                flows_to_prune.append(key)
+        for key in flows_to_prune:
+            del micro_flow_manager_live.flows[key]
+
+
+# --- Live IDS: Step 3: Start sniffing network traffic ---
+def start_live_ids(interface=None):
+    """
+    Starts sniffing live network traffic and applies the IDS model.
+    """
+    print(f"\n--- Starting Live IDS Monitoring on interface: {interface if interface else 'all available interfaces'} ---")
+    print("Press Ctrl+C to stop.")
+    try:
+        sniff(prn=process_packet, store=0, iface=interface, filter="ip") 
+    except KeyboardInterrupt:
+        print(f"\n{bcolors.OKCYAN}IDS monitoring stopped by user.{bcolors.ENDC}")
+    except Exception as e:
+        print(f"{bcolors.FAIL}An error occurred during sniffing: {e}{bcolors.ENDC}")
+        if "Permission denied" in str(e) or "You don't have permission" in str(e):
+            print(f"{bcolors.WARNING}Hint: Try running with sudo/administrator privileges (e.g., 'sudo python {sys.argv[0]}').{bcolors.ENDC}")
+        elif "No such device" in str(e) or "No such interface" in str(e):
+             print(f"{bcolors.WARNING}Hint: Check your network interface name. Use 'ip a' (Linux) or 'ipconfig' (Windows) to list available interfaces.{bcolors.ENDC}")
+        else:
+            raise # Re-raise if it's an unhandled error
+
+
+# --- Main execution ---
+if __name__ == "__main__":
+    # >>> IMPORTANT: Configure your network interface here <<<
+    # Example: "eth0" (Linux), "en0" (macOS), "Ethernet" or "Wi-Fi" (Windows)
+    network_interface = 'WiFi' # <--- SET YOUR INTERFACE HERE (e.g., 'Ethernet', 'Wi-Fi')
+    
+    start_live_ids(interface=network_interface)
