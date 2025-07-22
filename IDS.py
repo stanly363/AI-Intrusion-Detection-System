@@ -1,4 +1,4 @@
-# live_ids_compatible.py
+
 # --- Live IDS: Step 0: Import necessary libraries ---
 import tensorflow as tf
 import joblib
