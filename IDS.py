@@ -1,5 +1,3 @@
-# live_ids_compatible.py
-# --- Live IDS: Step 0: Import necessary libraries ---
 import tensorflow as tf
 import joblib
 import pandas as pd
@@ -273,7 +271,7 @@ def process_packet(packet):
 
         # Check for any NaN values before scaling (a sanity check)
         if features_to_scale.isnull().any().any():
-            print(f"{bcolors.FAIL}DEBUG (Live IDS): NaN values detected in features_to_scale BEFORE scaling! This is unexpected.{bcolors.ENDC}")
+            print(f"[{current_time_display.strftime('%Y-%m-%d %H:%M:%S')}] {bcolors.FAIL}DEBUG (Live IDS): NaN values detected in features_to_scale BEFORE scaling! This is unexpected.{bcolors.ENDC}")
 
         # Apply scaling
         features_df_scaled = scaler.transform(features_to_scale)
@@ -343,22 +341,24 @@ def start_live_ids(interface=None):
 
 # --- Main execution ---
 if __name__ == "__main__":
-    # >>> IMPORTANT: Configure your network interface here <<<
-    # Example: "eth0" (Linux), "en0" (macOS), "Ethernet" or "Wi-Fi" (Windows)
-    network_interface = 'WiFi' # <--- SET YOUR INTERFACE HERE (e.g., 'Ethernet', 'Wi-Fi')
-    
     # --- Argument Parsing ---
-    parser = argparse.ArgumentParser(description="Live Intrusion Detection System.")
+    parser = argparse.ArgumentParser(
+        description="Live Intrusion Detection System. Monitor network traffic for anomalies.",
+        formatter_class=argparse.RawTextHelpFormatter # For better formatting of help text
+    )
+    parser.add_argument('-i', '--interface', required=True,
+                        help='Network interface to monitor (e.g., "WiFi", "Ethernet", "eth0", "en0").\n'
+                             'On Windows, use "Wi-Fi" or "Ethernet". On Linux/macOS, use "eth0", "en0", etc.\n'
+                             'You can list interfaces with "ipconfig" (Windows) or "ip a" (Linux).')
     parser.add_argument('--pretrained', action='store_true',
-                        help='Use models from the "pretrained" subdirectory.')
-    args = parser.parse_args()
+                        help='Use models from the "pretrained" subdirectory '
+                             'instead of the current directory.')
+    
+    args = parser.parse_args() # This will handle invalid usage and print help/error
 
     model_load_path = ""
     if args.pretrained:
         model_load_path = "pretrained"
-        # Create the 'pretrained' directory if it doesn't exist.
-        # This check is primarily to provide a helpful error message if the user specifies --pretrained
-        # but the directory is missing.
         if not os.path.exists(model_load_path):
             print(f"{bcolors.FAIL}Error: Pretrained models directory '{model_load_path}' not found.{bcolors.ENDC}")
             sys.exit(1)
@@ -367,4 +367,5 @@ if __name__ == "__main__":
     # The load_ids_artifacts function now handles assigning to global variables directly.
     load_ids_artifacts(model_load_path)
 
-    start_live_ids(interface=network_interface)
+    # Start sniffing on the interface specified by the -i flag
+    start_live_ids(interface=args.interface)
