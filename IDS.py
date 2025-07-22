@@ -221,7 +221,7 @@ def load_ids_artifacts(model_path_prefix=""):
         best_threshold_from_training = joblib.load(os.path.join(model_path_prefix, 'best_threshold_live_compatible.pkl'))
         
         # Default to the F1-optimized threshold from training
-        best_threshold = best_threshold_from_training 
+        best_threshold = 0.9
         
         # This list will contain the *exact* feature names and order that the model was trained on.
         required_feature_names = model_columns 
