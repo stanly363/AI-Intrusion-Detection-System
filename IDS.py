@@ -47,7 +47,10 @@ ALLOWLIST_IPS = {
     '13.107.0.0/16',
     '40.74.0.0/15',
     '52.96.0.0/14',
-    
+    '74.125.0.0/16',    # Google Services (Search, Gmail, etc.)
+    '172.217.0.0/16',   # Google Services
+    '34.0.0.0/8',       # Google Cloud Platform
+    '35.184.0.0/13',    # Google Cloud Platform
     '104.16.0.0/12',    # Cloudflare
     '172.64.0.0/13',   # Cloudflare
     '151.101.0.0/16',  # Fastly
