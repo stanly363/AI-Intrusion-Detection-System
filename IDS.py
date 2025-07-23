@@ -1,3 +1,5 @@
+# live_ids_compatible.py
+# --- Live IDS: Step 0: Import necessary libraries ---
 import tensorflow as tf
 import joblib
 import pandas as pd
@@ -25,6 +27,33 @@ class bcolors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+
+
+# --- Comprehensive IP Allowlist Configuration ---
+ALLOWLIST_IPS = {
+    # --- 1. Essential Local Network ---
+    '192.168.10.1',      # Common router/gateway IP
+
+    # --- 2. Public DNS Servers ---
+    '8.8.8.8',          # Google Public DNS
+    '8.8.4.4',          # Google Public DNS
+    '1.1.1.1',          # Cloudflare Public DNS
+    '1.0.0.1',          # Cloudflare Public DNS
+
+    # Apple (macOS/iOS Updates, iCloud, App Store, etc.)
+    '17.0.0.0/8',
+
+    # Microsoft (Windows Update, Office 365, Azure, etc.)
+    '13.107.0.0/16',
+    '40.74.0.0/15',
+    '52.96.0.0/14',
+    
+    '104.16.0.0/12',    # Cloudflare
+    '172.64.0.0/13',   # Cloudflare
+    '151.101.0.0/16',  # Fastly
+    '23.0.0.0/11',     # Akamai
+    '104.64.0.0/10'    # Akamai
+}
 
 # --- Micro-Flow Configuration (MUST MATCH TRAINER'S) ---
 MICRO_FLOW_WINDOW_SEC = 2.0 # Time window for micro-flow aggregation
@@ -197,7 +226,6 @@ def extract_combined_features(packet, packet_timestamp):
 
 
 # Global variables to hold loaded models and artifacts
-# These are initialized to None and will be populated by load_ids_artifacts
 final_model = None
 scaler = None
 required_feature_names = None
@@ -205,12 +233,7 @@ best_threshold = None
 
 # --- Live IDS: Step 1: Load the saved models and artifacts ---
 def load_ids_artifacts(model_path_prefix=""):
-    """
-    Loads the IDS model and associated artifacts from the specified path prefix
-    and assigns them to global variables.
-    """
-    # Declare variables as global so assignments within this function
-    # modify the global scope variables, not create new local ones.
+    """Loads the IDS model and associated artifacts."""
     global final_model, scaler, required_feature_names, best_threshold 
     
     print("--- Loading IDS Artifacts ---")
@@ -220,72 +243,58 @@ def load_ids_artifacts(model_path_prefix=""):
         model_columns = joblib.load(os.path.join(model_path_prefix, 'model_columns_live_compatible.pkl'))
         best_threshold_from_training = joblib.load(os.path.join(model_path_prefix, 'best_threshold_live_compatible.pkl'))
         
-        # Default to the F1-optimized threshold from training
         best_threshold = 0.9
         
-        # This list will contain the *exact* feature names and order that the model was trained on.
         required_feature_names = model_columns 
 
         print(f"{bcolors.OKGREEN}Models and artifacts loaded successfully from '{model_path_prefix}'!{bcolors.ENDC}")
         print(f"Optimal Prediction Threshold: {best_threshold:.4f} (Originally optimized to: {best_threshold_from_training:.4f})")
 
-        # --- DEBUGGING ADDITION START ---
         print(f"\n{bcolors.OKBLUE}DEBUG (Live IDS): `required_feature_names` loaded from model_columns.pkl:{bcolors.ENDC}")
         print(required_feature_names)
         print(f"Number of required_feature_names: {len(required_feature_names)}")
-        # --- DEBUGGING ADDITION END ---
-        
-        # No return statement needed here as we are assigning directly to globals
-        # The variables final_model, scaler, etc. are now populated globally.
 
     except Exception as e:
         print(f"{bcolors.FAIL}Error loading artifacts from '{model_path_prefix}': {e}{bcolors.ENDC}")
-        print(f"Please ensure the necessary files are in the '{model_path_prefix}' directory: 'ids_live_compatible_model.keras', 'scaler_live_compatible.gz', 'model_columns_live_compatible.pkl', and 'best_threshold_live_compatible.pkl'.")
+        print(f"Please ensure the necessary files are in the '{model_path_prefix}' directory.")
         sys.exit(1)
 
 
 # --- Live IDS: Step 2: Define packet processing callback function ---
 def process_packet(packet):
-    current_time_unix = time.time() # Use Unix timestamp for consistency with packet.time in trainer
+    current_time_unix = time.time()
     current_time_display = datetime.datetime.fromtimestamp(current_time_unix)
     
-    # Filter out non-IP packets early, as our features rely on IP and higher layers
     if not IP in packet:
         return
+
+    # --- ADDED: Check against allowlist before processing ---
+    src_ip = packet[IP].src
+    dst_ip = packet[IP].dst
+    if src_ip in ALLOWLIST_IPS or dst_ip in ALLOWLIST_IPS:
+        return # Silently ignore packets from/to allowlisted IPs
+    # --- END ADDED ---
         
     try:
-        # Extract combined features (packet + micro-flow)
         raw_features = extract_combined_features(packet, current_time_unix)
-        
-        # Create a DataFrame from the extracted features
         extracted_df = pd.DataFrame([raw_features])
-        
-        # Ensure all required_feature_names (which are `model_columns`) are present.
-        # Initialize a DataFrame with zeros for all required features.
         features_to_scale = pd.DataFrame(0.0, index=[0], columns=required_feature_names)
         
-        # Copy values from the extracted features into the aligned DataFrame
         for col in extracted_df.columns:
             if col in features_to_scale.columns:
                 features_to_scale[col] = extracted_df[col]
 
-        # Check for any NaN values before scaling (a sanity check)
         if features_to_scale.isnull().any().any():
-            print(f"[{current_time_display.strftime('%Y-%m-%d %H:%M:%S')}] {bcolors.FAIL}DEBUG (Live IDS): NaN values detected in features_to_scale BEFORE scaling! This is unexpected.{bcolors.ENDC}")
+            print(f"[{current_time_display.strftime('%Y-%m-%d %H:%M:%S')}] {bcolors.FAIL}DEBUG (Live IDS): NaN values detected in features_to_scale BEFORE scaling!{bcolors.ENDC}")
 
-        # Apply scaling
         features_df_scaled = scaler.transform(features_to_scale)
-        
-        # Make prediction
         prediction_prob = final_model.predict(features_df_scaled, verbose=0)[0][0] 
         prediction_label = "ATTACK" if prediction_prob > best_threshold else "NORMAL"
 
-        # --- MODIFIED PRINT LOGIC: Only print for ATTACK detections ---
         if prediction_label == "ATTACK":
-            status_color = bcolors.FAIL # Attack is always red
+            status_color = bcolors.FAIL
             
-            src_ip = packet[IP].src
-            dst_ip = packet[IP].dst
+            # Note: src_ip and dst_ip are already defined above for the allowlist check
             protocol_name_display = {6: 'TCP', 17: 'UDP', 1: 'ICMP'}.get(packet[IP].proto, 'OTHER')
 
             print(f"[{current_time_display.strftime('%Y-%m-%d %H:%M:%S')}] "
@@ -294,23 +303,15 @@ def process_packet(packet):
                   f"Size: {len(packet)} bytes | "
                   f"Prob: {prediction_prob:.4f})")
             print(f"{bcolors.WARNING}!!! POTENTIAL INTRUSION DETECTED !!! (Packet from {src_ip}){bcolors.ENDC}")
-            # Add your alerting mechanism here: logging, notifications, SIEM integration
-        # --- END MODIFIED PRINT LOGIC ---
 
     except Exception as e:
-        # Catch any errors during feature extraction, scaling, or prediction for a single packet
-        # This allows the IDS to continue processing even if one packet causes an issue.
         src_ip_str = packet[IP].src if IP in packet else "N/A"
         dst_ip_str = packet[IP].dst if IP in packet else "N/A"
         print(f"[{current_time_display.strftime('%Y-%m-%d %H:%M:%S')}] {bcolors.FAIL}Error processing packet from {src_ip_str} to {dst_ip_str}: {e}{bcolors.ENDC}")
-        # Consider adding more specific error logging here for analysis.
 
     finally:
-        # Prune old micro-flows to prevent memory leak for long-running processes
-        # This runs regardless of whether an error occurred in packet processing.
         global micro_flow_manager_live
         flows_to_prune = []
-        # Iterate over a copy of items to allow modification during loop
         for key, flow_data in list(micro_flow_manager_live.flows.items()): 
             if flow_data and (current_time_unix - flow_data.last_packet_time) > MICRO_FLOW_WINDOW_SEC * 2: 
                 flows_to_prune.append(key)
@@ -320,9 +321,7 @@ def process_packet(packet):
 
 # --- Live IDS: Step 3: Start sniffing network traffic ---
 def start_live_ids(interface=None):
-    """
-    Starts sniffing live network traffic and applies the IDS model.
-    """
+    """Starts sniffing live network traffic and applies the IDS model."""
     print(f"\n--- Starting Live IDS Monitoring on interface: {interface if interface else 'all available interfaces'} ---")
     print("Press Ctrl+C to stop.")
     try:
@@ -332,29 +331,24 @@ def start_live_ids(interface=None):
     except Exception as e:
         print(f"{bcolors.FAIL}An error occurred during sniffing: {e}{bcolors.ENDC}")
         if "Permission denied" in str(e) or "You don't have permission" in str(e):
-            print(f"{bcolors.WARNING}Hint: Try running with sudo/administrator privileges (e.g., 'sudo python {sys.argv[0]}').{bcolors.ENDC}")
+            print(f"{bcolors.WARNING}Hint: Try running with sudo/administrator privileges.{bcolors.ENDC}")
         elif "No such device" in str(e) or "No such interface" in str(e):
-             print(f"{bcolors.WARNING}Hint: Check your network interface name. Use 'ip a' (Linux) or 'ipconfig' (Windows) to list available interfaces.{bcolors.ENDC}")
+             print(f"{bcolors.WARNING}Hint: Check your network interface name.{bcolors.ENDC}")
         else:
-            raise # Re-raise if it's an unhandled error
-
+            raise
 
 # --- Main execution ---
 if __name__ == "__main__":
-    # --- Argument Parsing ---
     parser = argparse.ArgumentParser(
         description="Live Intrusion Detection System. Monitor network traffic for anomalies.",
-        formatter_class=argparse.RawTextHelpFormatter # For better formatting of help text
+        formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument('-i', '--interface', required=True,
-                        help='Network interface to monitor (e.g., "WiFi", "Ethernet", "eth0", "en0").\n'
-                             'On Windows, use "Wi-Fi" or "Ethernet". On Linux/macOS, use "eth0", "en0", etc.\n'
-                             'You can list interfaces with "ipconfig" (Windows) or "ip a" (Linux).')
+                        help='Network interface to monitor (e.g., "WiFi", "Ethernet", "eth0", "en0").')
     parser.add_argument('--pretrained', action='store_true',
-                        help='Use models from the "pretrained" subdirectory '
-                             'instead of the current directory.')
+                        help='Use models from the "pretrained" subdirectory.')
     
-    args = parser.parse_args() # This will handle invalid usage and print help/error
+    args = parser.parse_args()
 
     model_load_path = ""
     if args.pretrained:
@@ -363,9 +357,5 @@ if __name__ == "__main__":
             print(f"{bcolors.FAIL}Error: Pretrained models directory '{model_load_path}' not found.{bcolors.ENDC}")
             sys.exit(1)
     
-    # Load models and artifacts based on the chosen path.
-    # The load_ids_artifacts function now handles assigning to global variables directly.
     load_ids_artifacts(model_load_path)
-
-    # Start sniffing on the interface specified by the -i flag
     start_live_ids(interface=args.interface)
