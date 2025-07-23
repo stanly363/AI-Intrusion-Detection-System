@@ -233,6 +233,7 @@ final_model = None
 scaler = None
 required_feature_names = None
 best_threshold = None
+last_attack_source_ip = None
 
 # --- Live IDS: Step 1: Load the saved models and artifacts ---
 def load_ids_artifacts(model_path_prefix=""):
@@ -265,18 +266,19 @@ def load_ids_artifacts(model_path_prefix=""):
 
 # --- Live IDS: Step 2: Define packet processing callback function ---
 def process_packet(packet):
+    global last_attack_source_ip
+
     current_time_unix = time.time()
     current_time_display = datetime.datetime.fromtimestamp(current_time_unix)
     
     if not IP in packet:
         return
 
-    # --- ADDED: Check against allowlist before processing ---
+    # Check against allowlist before processing
     src_ip = packet[IP].src
     dst_ip = packet[IP].dst
     if src_ip in ALLOWLIST_IPS or dst_ip in ALLOWLIST_IPS:
         return # Silently ignore packets from/to allowlisted IPs
-    # --- END ADDED ---
         
     try:
         raw_features = extract_combined_features(packet, current_time_unix)
@@ -295,17 +297,27 @@ def process_packet(packet):
         prediction_label = "ATTACK" if prediction_prob > best_threshold else "NORMAL"
 
         if prediction_label == "ATTACK":
-            status_color = bcolors.FAIL
-            
-            # Note: src_ip and dst_ip are already defined above for the allowlist check
-            protocol_name_display = {6: 'TCP', 17: 'UDP', 1: 'ICMP'}.get(packet[IP].proto, 'OTHER')
+            # --- NEW: Manual rule for consecutive attacks ---
+            # Check if the current attacker is the same as the last one
+            if src_ip == last_attack_source_ip:
+                # This is the second (or more) consecutive attack from this IP, so we print the alert.
+                status_color = bcolors.FAIL
+                protocol_name_display = {6: 'TCP', 17: 'UDP', 1: 'ICMP'}.get(packet[IP].proto, 'OTHER')
 
-            print(f"[{current_time_display.strftime('%Y-%m-%d %H:%M:%S')}] "
-                  f"[{status_color}{prediction_label}{bcolors.ENDC}] "
-                  f"Packet: {src_ip} -> {dst_ip} (Proto: {protocol_name_display}) | "
-                  f"Size: {len(packet)} bytes | "
-                  f"Prob: {prediction_prob:.4f})")
-            print(f"{bcolors.WARNING}!!! POTENTIAL INTRUSION DETECTED !!! (Packet from {src_ip}){bcolors.ENDC}")
+                print(f"[{current_time_display.strftime('%Y-%m-%d %H:%M:%S')}] "
+                      f"[{status_color}{prediction_label}{bcolors.ENDC}] "
+                      f"Packet: {src_ip} -> {dst_ip} (Proto: {protocol_name_display}) | "
+                      f"Size: {len(packet)} bytes | "
+                      f"Prob: {prediction_prob:.4f})")
+                print(f"{bcolors.WARNING}!!! POTENTIAL INTRUSION DETECTED !!! (Packet from {src_ip}){bcolors.ENDC}")
+            
+            # Update the last attacker IP regardless of whether we printed.
+            # This "arms" the system for the next packet.
+            last_attack_source_ip = src_ip
+            # --- END NEW ---
+        else:
+            # If the packet is normal, reset the last attacker tracker.
+            last_attack_source_ip = None
 
     except Exception as e:
         src_ip_str = packet[IP].src if IP in packet else "N/A"
@@ -320,7 +332,6 @@ def process_packet(packet):
                 flows_to_prune.append(key)
         for key in flows_to_prune:
             del micro_flow_manager_live.flows[key]
-
 
 # --- Live IDS: Step 3: Start sniffing network traffic ---
 def start_live_ids(interface=None):
