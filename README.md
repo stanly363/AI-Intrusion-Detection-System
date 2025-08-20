@@ -39,7 +39,7 @@ First, clone the repository and install the necessary software and libraries.
 **For all Operating Systems:**
 ```bash
 # Clone the repository
-git clone [https://github.com/your-username/ai-intrusion-detection-system.git](https://github.com/your-username/ai-intrusion-detection-system.git)
+git clone https://github.com/stanly363/ai-intrusion-detection-system.git
 cd ai-intrusion-detection-system
 
 # Install the required Python libraries
